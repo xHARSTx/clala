@@ -1,706 +1,1006 @@
--- TurtleSpy V3.0 Complete - Remote Spy Browser
--- Versão completa SEM necessidade de hooks
--- Baseado no TurtleSpy original
+--[[
+╔══════════════════════════════════════════════════════════════╗
+║     MOVEMENT STUDIO v2 — Gravador + Reprodutor Roblox       ║
+║                                                              ║
+║ INSTALAR:                                                    ║
+║   StarterPlayer → StarterCharacterScripts → LocalScript      ║
+║                                                              ║
+║ FLUXO:                                                       ║
+║   1. Grave com F ou botão REC                                ║
+║   2. Gere o código com K ou botão EXPORT                     ║
+║   3. Cole esse código na caixa quando quiser reutilizar      ║
+║   4. Clique em LOAD e depois PLAY                            ║
+║                                                              ║
+║ TECLAS:                                                      ║
+║   F = gravar/parar                                           ║
+║   G = play/stop                                              ║
+║   H = pause/retomar                                          ║
+║   J = limpar tudo                                            ║
+║   K = exportar código                                        ║
+║   L = alternar loop                                          ║
+║   + / - = velocidade                                         ║
+╚══════════════════════════════════════════════════════════════╝
+--]]
 
-local settings = {
-    Keybind = Enum.KeyCode.P
-}
+-- Opcional: cole um path exportado aqui para carregar ao iniciar.
+local PATH_DATA = nil
 
--- Serviços
-local Players = game:GetService("Players")
-local CoreGui = game:GetService("CoreGui")
+local Players        = game:GetService("Players")
+local RunService     = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local HttpService = game:GetService("HttpService")
+local TweenService   = game:GetService("TweenService")
 
 local LocalPlayer = Players.LocalPlayer
+local Character   = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local Humanoid    = Character:WaitForChild("Humanoid")
+local RootPart    = Character:WaitForChild("HumanoidRootPart")
 
--- Limpar versão anterior
-pcall(function()
-    if CoreGui:FindFirstChild("TurtleSpyGUI") then
-        CoreGui:FindFirstChild("TurtleSpyGUI"):Destroy()
-    end
+-- ─── Constantes ──────────────────────────────────────────────────────────────
+
+local RECORD_FPS    = 30                -- FPS de captura (era 20)
+local RECORD_INTERVAL = 1 / RECORD_FPS
+local PLAYBACK_SPEEDS = {0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3}
+local EXPORT_START  = "-- PATH_EXPORT_BEGIN"
+local EXPORT_END    = "-- PATH_EXPORT_END"
+
+-- ─── Estado ──────────────────────────────────────────────────────────────────
+
+local frames        = {}
+local importedPath  = PATH_DATA
+local activeSource  = "recorded"
+local gravando      = false
+local reproduzindo  = false
+local pausado       = false
+local loopAtivo     = false
+local velocidadeIndex = 4
+local frameAtual    = 0
+local ultimoFrameTime = 0
+local ultimoNoAr    = false
+local tempoInicioReproducao = 0
+local tempoPausadoAcumulado = 0
+local tempoInicioPausa = 0
+local playbackPartStates = {}
+local playbackHumanoidState = nil
+local playbackRigPrepared = false
+local conexaoGravacao  = nil
+local conexaoReproducao = nil
+
+-- Referências de UI (declaradas antes de uso)
+local statusDot, statusLbl, detailsLbl
+local speedChip, loopChip, sourceChip
+local progressFill, progressLbl
+local recBtn, playBtn, pauseBtn, loopBtn
+local loadBtn, exportBtn, clearBtn, speedDownBtn, speedUpBtn
+local outputBox, noticeLbl
+
+-- ─── Personagem ──────────────────────────────────────────────────────────────
+
+local function refreshCharacter()
+    Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    Humanoid  = Character:FindFirstChildOfClass("Humanoid") or Character:WaitForChild("Humanoid")
+    RootPart  = Character:FindFirstChild("HumanoidRootPart") or Character:WaitForChild("HumanoidRootPart")
+end
+
+LocalPlayer.CharacterAdded:Connect(function(c)
+    Character = c
+    Humanoid  = c:WaitForChild("Humanoid")
+    RootPart  = c:WaitForChild("HumanoidRootPart")
+    playbackPartStates  = {}
+    playbackHumanoidState = nil
+    playbackRigPrepared = false
 end)
 
--- Verificar suporte do executor
-local hasSetClipboard = setclipboard ~= nil
-local hasDecompile = decompile ~= nil
+-- ─── Helpers ─────────────────────────────────────────────────────────────────
+
+local function getPlaybackSpeed()
+    return PLAYBACK_SPEEDS[velocidadeIndex]
+end
+
+local function getPathForSource(source)
+    if source == "imported" then
+        return importedPath, "caixa"
+    end
+    if #frames > 0 then
+        return {fps = RECORD_FPS, f = frames}, "gravacao"
+    end
+    if importedPath then
+        return importedPath, "caixa"
+    end
+    return nil, "nenhuma"
+end
+
+local function getActivePath()
+    return getPathForSource(activeSource)
+end
+
+-- ─── Validação ───────────────────────────────────────────────────────────────
+-- Frame agora tem 8 campos: x,y,z, qx,qy,qz,qw, jump
+
+local function validarFrame(f)
+    if type(f) ~= "table" or #f ~= 8 then return false end
+    for i = 1, 8 do
+        if type(f[i]) ~= "number" then return false end
+    end
+    return true
+end
+
+-- Compatibilidade com frames antigos de 6 campos
+local function validarFrameLegacy(f)
+    return type(f) == "table" and #f == 6
+        and type(f[1]) == "number" and type(f[2]) == "number"
+        and type(f[3]) == "number" and type(f[4]) == "number"
+        and type(f[5]) == "number" and type(f[6]) == "number"
+end
+
+local function validarPath(path)
+    if path == nil then return false, "Nenhum PATH carregado." end
+    if type(path) ~= "table" then return false, "PATH invalido: precisa ser tabela." end
+    if type(path.fps) ~= "number" or type(path.f) ~= "table" then
+        return false, "PATH invalido: formato incorreto."
+    end
+    if path.fps <= 0 then return false, "PATH invalido: fps deve ser > 0." end
+    if #path.f == 0 then return false, "PATH vazio." end
+    for i, frame in ipairs(path.f) do
+        if not validarFrame(frame) and not validarFrameLegacy(frame) then
+            return false, ("Frame %d invalido."):format(i)
+        end
+    end
+    return true, "OK"
+end
+
+-- ─── Física / Rig ────────────────────────────────────────────────────────────
+
+local function setFisica(ativa)
+    if not Humanoid then return end
+    if ativa then
+        Humanoid.WalkSpeed    = (playbackHumanoidState and playbackHumanoidState.WalkSpeed) or 16
+        Humanoid.AutoRotate   = (playbackHumanoidState and playbackHumanoidState.AutoRotate) ~= false
+        Humanoid.JumpPower    = (playbackHumanoidState and playbackHumanoidState.JumpPower) or 50
+        Humanoid.PlatformStand = false
+    else
+        playbackHumanoidState = {
+            WalkSpeed    = Humanoid.WalkSpeed,
+            AutoRotate   = Humanoid.AutoRotate,
+            JumpPower    = Humanoid.JumpPower,
+            PlatformStand = Humanoid.PlatformStand,
+        }
+        Humanoid.WalkSpeed    = 0
+        Humanoid.AutoRotate   = false
+        Humanoid.JumpPower    = 0
+        Humanoid.PlatformStand = false
+    end
+end
+
+local function estaNoAr()
+    local s = Humanoid:GetState()
+    return s == Enum.HumanoidStateType.Jumping or s == Enum.HumanoidStateType.Freefall
+end
+
+local function prepararRigParaPlayback()
+    playbackRigPrepared = true
+    playbackPartStates  = {}
+    for _, desc in ipairs(Character:GetDescendants()) do
+        if desc:IsA("BasePart") then
+            playbackPartStates[desc] = {
+                Anchored  = desc.Anchored,
+                CanCollide = desc.CanCollide,
+            }
+            desc.CanCollide = false
+            desc.AssemblyLinearVelocity  = Vector3.zero
+            desc.AssemblyAngularVelocity = Vector3.zero
+        end
+    end
+    setFisica(false)
+end
+
+local function restaurarRigDepoisPlayback()
+    if not playbackRigPrepared then return end
+    for part, state in pairs(playbackPartStates) do
+        if part and part.Parent then
+            part.Anchored   = state.Anchored
+            part.CanCollide = state.CanCollide
+            part.AssemblyLinearVelocity  = Vector3.zero
+            part.AssemblyAngularVelocity = Vector3.zero
+        end
+    end
+    playbackPartStates = {}
+    setFisica(true)
+    if Humanoid then
+        Humanoid.PlatformStand = false
+        Humanoid:ChangeState(Enum.HumanoidStateType.Running)
+    end
+    playbackHumanoidState = nil
+    playbackRigPrepared   = false
+end
+
+-- ─── CFrame helpers ──────────────────────────────────────────────────────────
+
+-- Converte CFrame para quaternion (x,y,z,w)
+local function cfToQuat(cf)
+    local rx, ry, rz, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cf:GetComponents()
+    local trace = r00 + r11 + r22
+    local qx, qy, qz, qw
+    if trace > 0 then
+        local s = 0.5 / math.sqrt(trace + 1)
+        qw = 0.25 / s
+        qx = (r21 - r12) * s
+        qy = (r02 - r20) * s
+        qz = (r10 - r01) * s
+    elseif r00 > r11 and r00 > r22 then
+        local s = 2 * math.sqrt(1 + r00 - r11 - r22)
+        qw = (r21 - r12) / s
+        qx = 0.25 * s
+        qy = (r01 + r10) / s
+        qz = (r02 + r20) / s
+    elseif r11 > r22 then
+        local s = 2 * math.sqrt(1 + r11 - r00 - r22)
+        qw = (r02 - r20) / s
+        qx = (r01 + r10) / s
+        qy = 0.25 * s
+        qz = (r12 + r21) / s
+    else
+        local s = 2 * math.sqrt(1 + r22 - r00 - r11)
+        qw = (r10 - r01) / s
+        qx = (r02 + r20) / s
+        qy = (r12 + r21) / s
+        qz = 0.25 * s
+    end
+    return qx, qy, qz, qw
+end
+
+-- Constrói CFrame a partir de posição + quaternion
+local function cfFromPosQuat(x, y, z, qx, qy, qz, qw)
+    -- normaliza quaternion
+    local len = math.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
+    if len < 0.0001 then qw = 1; qx = 0; qy = 0; qz = 0; len = 1 end
+    qx, qy, qz, qw = qx/len, qy/len, qz/len, qw/len
+    local r00 = 1 - 2*(qy*qy + qz*qz)
+    local r01 = 2*(qx*qy - qz*qw)
+    local r02 = 2*(qx*qz + qy*qw)
+    local r10 = 2*(qx*qy + qz*qw)
+    local r11 = 1 - 2*(qx*qx + qz*qz)
+    local r12 = 2*(qy*qz - qx*qw)
+    local r20 = 2*(qx*qz - qy*qw)
+    local r21 = 2*(qy*qz + qx*qw)
+    local r22 = 1 - 2*(qx*qx + qy*qy)
+    return CFrame.new(x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22)
+end
+
+-- SLERP de quaternions para rotação suave
+local function slerpQuat(ax, ay, az, aw, bx, by, bz, bw, t)
+    local dot = ax*bx + ay*by + az*bz + aw*bw
+    -- escolhe caminho mais curto
+    if dot < 0 then
+        bx, by, bz, bw = -bx, -by, -bz, -bw
+        dot = -dot
+    end
+    if dot > 0.9995 then
+        -- interpolação linear para quaternions muito próximos
+        local rx = ax + t*(bx - ax)
+        local ry = ay + t*(by - ay)
+        local rz = az + t*(bz - az)
+        local rw = aw + t*(bw - aw)
+        local len = math.sqrt(rx*rx + ry*ry + rz*rz + rw*rw)
+        return rx/len, ry/len, rz/len, rw/len
+    end
+    local theta0 = math.acos(dot)
+    local theta  = theta0 * t
+    local sinT0  = math.sin(theta0)
+    local sinT   = math.sin(theta)
+    local s0 = math.cos(theta) - dot * sinT / sinT0
+    local s1 = sinT / sinT0
+    return
+        s0*ax + s1*bx,
+        s0*ay + s1*by,
+        s0*az + s1*bz,
+        s0*aw + s1*bw
+end
+
+-- Converte frame legado (6 campos: x,y,z,lx,lz,jump) para o novo formato
+local function upgradeFrameLegacy(f)
+    local lx, lz = f[4], f[5]
+    local flat = Vector3.new(lx, 0, lz)
+    if flat.Magnitude < 0.001 then flat = Vector3.new(0, 0, -1) else flat = flat.Unit end
+    local cf = CFrame.lookAt(Vector3.new(f[1], f[2], f[3]), Vector3.new(f[1], f[2], f[3]) + flat)
+    local qx, qy, qz, qw = cfToQuat(cf)
+    return {f[1], f[2], f[3], qx, qy, qz, qw, f[6]}
+end
+
+-- Garante que um frame está no formato novo
+local function normalizeFrame(f)
+    if #f == 6 then return upgradeFrameLegacy(f) end
+    return f
+end
+
+-- ─── Gravação ────────────────────────────────────────────────────────────────
+
+local function gravarFrame()
+    local agora = tick()
+    if agora - ultimoFrameTime < RECORD_INTERVAL then return end
+    ultimoFrameTime = agora
+
+    local cf    = RootPart.CFrame
+    local pos   = cf.Position
+    local noAr  = estaNoAr()
+    local pulou = noAr and not ultimoNoAr
+    ultimoNoAr  = noAr
+
+    local qx, qy, qz, qw = cfToQuat(cf)
+    -- arredonda para compactar exportação
+    local function r2(v) return math.round(v * 100) / 100 end
+    local function r4(v) return math.round(v * 10000) / 10000 end
+
+    frames[#frames + 1] = {
+        r2(pos.X), r2(pos.Y), r2(pos.Z),
+        r4(qx), r4(qy), r4(qz), r4(qw),
+        pulou and 1 or 0,
+    }
+end
+
+local function setNotice(text, color)
+    if not noticeLbl then return end
+    noticeLbl.Text       = text
+    noticeLbl.TextColor3 = color
+end
+
+local function pararGravacao()
+    if not gravando then return end
+    gravando = false
+    if conexaoGravacao then
+        conexaoGravacao:Disconnect()
+        conexaoGravacao = nil
+    end
+    activeSource = "recorded"
+    setNotice(("Gravacao finalizada: %d frames (%.1fs)"):format(#frames, #frames / RECORD_FPS),
+        Color3.fromRGB(118, 199, 255))
+end
+
+local function iniciarGravacao()
+    if reproduzindo then return end
+    refreshCharacter()
+    restaurarRigDepoisPlayback()
+    if Humanoid then Humanoid.PlatformStand = false end
+    frames      = {}
+    activeSource = "recorded"
+    frameAtual  = 0
+    gravando    = true
+    ultimoNoAr  = false
+    ultimoFrameTime = 0
+    conexaoGravacao = RunService.Heartbeat:Connect(gravarFrame)
+    setNotice("Gravando... (F para parar)", Color3.fromRGB(255, 100, 100))
+end
+
+-- ─── Reprodução ──────────────────────────────────────────────────────────────
+
+local function aplicarFrameData(frame)
+    local f = normalizeFrame(frame)
+    Character:PivotTo(cfFromPosQuat(f[1], f[2], f[3], f[4], f[5], f[6], f[7]))
+end
+
+local function pararReproducao(finalNotice, finalColor)
+    if conexaoReproducao then
+        conexaoReproducao:Disconnect()
+        conexaoReproducao = nil
+    end
+    reproduzindo = false
+    pausado      = false
+    frameAtual   = 0
+    tempoPausadoAcumulado = 0
+    tempoInicioPausa = 0
+    restaurarRigDepoisPlayback()
+    setNotice(finalNotice or "Reproducao parada.", finalColor or Color3.fromRGB(183, 194, 218))
+end
+
+local function iniciarReproducao()
+    if gravando then pararGravacao() end
+
+    local path, origem = getActivePath()
+    local ok, msg = validarPath(path)
+    if not ok then
+        setNotice("ERRO: " .. msg, Color3.fromRGB(255, 120, 100))
+        return
+    end
+
+    refreshCharacter()
+    prepararRigParaPlayback()
+
+    local total     = #path.f
+    local fps       = path.fps
+    local velocidade = getPlaybackSpeed()
+
+    reproduzindo = true
+    pausado      = false
+    frameAtual   = 1
+    tempoInicioReproducao = tick()
+    tempoPausadoAcumulado = 0
+    tempoInicioPausa = 0
+
+    aplicarFrameData(path.f[1])
+    task.wait(0.06)
+
+    setNotice(("Reproduzindo [%s] em %.2fx"):format(origem, velocidade), Color3.fromRGB(120, 233, 159))
+
+    conexaoReproducao = RunService.Heartbeat:Connect(function()
+        if not reproduzindo or pausado then return end
+
+        local tempo      = (tick() - tempoInicioReproducao - tempoPausadoAcumulado) * velocidade
+        local frameIdeal = tempo * fps + 1
+
+        if frameIdeal >= total then
+            aplicarFrameData(path.f[total])
+            frameAtual = total
+            if loopAtivo then
+                tempoInicioReproducao = tick()
+                tempoPausadoAcumulado = 0
+                frameAtual = 1
+                aplicarFrameData(path.f[1])
+                return
+            end
+            pararReproducao("Reproducao concluida.", Color3.fromRGB(120, 233, 159))
+            return
+        end
+
+        local iA = math.clamp(math.floor(frameIdeal), 1, total)
+        local iB = math.clamp(iA + 1, 1, total)
+        local alpha = frameIdeal - iA
+
+        local fA = normalizeFrame(path.f[iA])
+        local fB = normalizeFrame(path.f[iB])
+
+        -- Interpolação de posição (linear é suficiente para pos)
+        local px = fA[1] + (fB[1] - fA[1]) * alpha
+        local py = fA[2] + (fB[2] - fA[2]) * alpha
+        local pz = fA[3] + (fB[3] - fA[3]) * alpha
+
+        -- SLERP para rotação suave
+        local qx, qy, qz, qw = slerpQuat(fA[4], fA[5], fA[6], fA[7], fB[4], fB[5], fB[6], fB[7], alpha)
+
+        Character:PivotTo(cfFromPosQuat(px, py, pz, qx, qy, qz, qw))
+
+        local novoFrame = math.floor(frameIdeal)
+        if novoFrame ~= frameAtual then
+            frameAtual = novoFrame
+            local fd = path.f[frameAtual]
+            if fd then
+                local fnorm = normalizeFrame(fd)
+                if fnorm[8] == 1 then
+                    Humanoid.Jump = true
+                    task.delay(0.05, function()
+                        if Humanoid then Humanoid.Jump = false end
+                    end)
+                end
+            end
+        end
+    end)
+end
+
+local function alternarPausa()
+    if not reproduzindo then return end
+    pausado = not pausado
+    if pausado then
+        tempoInicioPausa = tick()
+        setNotice("Pausado. (H para retomar)", Color3.fromRGB(255, 214, 120))
+    else
+        tempoPausadoAcumulado = tempoPausadoAcumulado + (tick() - tempoInicioPausa)
+        tempoInicioPausa = 0
+        setNotice("Retomado.", Color3.fromRGB(120, 233, 159))
+    end
+end
+
+local function limparTudo()
+    pararGravacao()
+    pararReproducao()
+    frames       = {}
+    importedPath = nil
+    activeSource = "recorded"
+    frameAtual   = 0
+    if outputBox then outputBox.Text = "" end
+    setNotice("Tudo limpo.", Color3.fromRGB(183, 194, 218))
+end
+
+local function ajustarVelocidade(delta)
+    velocidadeIndex = math.clamp(velocidadeIndex + delta, 1, #PLAYBACK_SPEEDS)
+    setNotice(("Velocidade: %.2fx"):format(getPlaybackSpeed()), Color3.fromRGB(183, 194, 218))
+end
+
+-- ─── Serialização / Parsing ──────────────────────────────────────────────────
+
+local function serializarPath(path)
+    local linhas = {EXPORT_START, ("fps=%d"):format(path.fps)}
+    for _, frame in ipairs(path.f) do
+        local f = normalizeFrame(frame)
+        linhas[#linhas + 1] = string.format(
+            "%.2f,%.2f,%.2f,%.4f,%.4f,%.4f,%.4f,%d",
+            f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8]
+        )
+    end
+    linhas[#linhas + 1] = EXPORT_END
+    linhas[#linhas + 1] = ""
+    linhas[#linhas + 1] = "-- Cole este bloco na caixa e clique em LOAD."
+    return table.concat(linhas, "\n")
+end
+
+local function gerarCodigo()
+    local path = (#frames > 0) and {fps = RECORD_FPS, f = frames} or importedPath or PATH_DATA
+    local ok, msg = validarPath(path)
+    if not ok then
+        return "-- Nenhum path valido.\n-- Grave algo ou cole um bloco exportado."
+    end
+    return serializarPath(path)
+end
+
+local function parsePathText(text)
+    if type(text) ~= "string" or text == "" then
+        return nil, "A caixa esta vazia."
+    end
+    local startIndex = text:find(EXPORT_START, 1, true)
+    local endIndex   = text:find(EXPORT_END,   1, true)
+    if not startIndex or not endIndex or endIndex <= startIndex then
+        return nil, "Bloco PATH_EXPORT nao encontrado."
+    end
+    local bloco = text:sub(startIndex + #EXPORT_START, endIndex - 1)
+    local fps = tonumber(bloco:match("fps%s*=%s*([%d%.%-]+)"))
+    if not fps or fps <= 0 then
+        return nil, "FPS invalido no texto."
+    end
+    local path = {fps = fps, f = {}}
+    for line in bloco:gmatch("[^\r\n]+") do
+        if not line:match("^%s*fps%s*=") then
+            local nums = {}
+            for num in line:gmatch("%-?%d+%.?%d*") do
+                nums[#nums + 1] = tonumber(num)
+            end
+            if #nums > 0 then
+                if #nums == 6 then
+                    -- frame legado — aceita e converte
+                    path.f[#path.f + 1] = nums
+                elseif #nums == 8 then
+                    path.f[#path.f + 1] = nums
+                else
+                    return nil, ("Frame com %d numeros (esperado 6 ou 8)."):format(#nums)
+                end
+            end
+        end
+    end
+    local ok, msg = validarPath(path)
+    if not ok then return nil, msg end
+    return path, "OK"
+end
+
+local function carregarDaCaixa()
+    local path, msg = parsePathText(outputBox.Text)
+    if not path then
+        setNotice("ERRO: " .. msg, Color3.fromRGB(255, 120, 100))
+        return
+    end
+    importedPath = path
+    activeSource = "imported"
+    frameAtual   = 0
+    setNotice(("Carregado da caixa: %d frames (%.1fs)"):format(#path.f, #path.f / path.fps),
+        Color3.fromRGB(118, 199, 255))
+end
+
+-- ─── UI ──────────────────────────────────────────────────────────────────────
+
+local existingGui = LocalPlayer:WaitForChild("PlayerGui"):FindFirstChild("MovementStudioGui")
+if existingGui then existingGui:Destroy() end
+
+local sg = Instance.new("ScreenGui")
+sg.Name          = "MovementStudioGui"
+sg.ResetOnSpawn  = false
+sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+sg.Parent        = LocalPlayer.PlayerGui
 
 -- Cores do tema
-local colors = {
-    headerColor = Color3.fromRGB(0, 168, 255),
-    headerShading = Color3.fromRGB(0, 151, 230),
-    headerText = Color3.fromRGB(47, 54, 64),
-    mainBg = Color3.fromRGB(47, 54, 64),
-    infoBg = Color3.fromRGB(47, 54, 64),
-    scrollBar = Color3.fromRGB(127, 143, 166),
-    buttonBg = Color3.fromRGB(53, 59, 72),
-    buttonBorder = Color3.fromRGB(113, 128, 147),
-    buttonText = Color3.fromRGB(220, 221, 225),
-    codeBg = Color3.fromRGB(35, 40, 48),
-    codeText = Color3.fromRGB(220, 221, 225),
-    codeComment = Color3.fromRGB(108, 108, 108),
-    green = Color3.fromRGB(46, 204, 113),
-    red = Color3.fromRGB(231, 76, 60),
-    orange = Color3.fromRGB(230, 126, 34)
+local C = {
+    BG       = Color3.fromRGB(11, 15, 24),
+    BG2      = Color3.fromRGB(16, 22, 36),
+    BG3      = Color3.fromRGB(8, 11, 18),
+    BORDER   = Color3.fromRGB(40, 68, 110),
+    TEXT     = Color3.fromRGB(215, 228, 252),
+    MUTED    = Color3.fromRGB(108, 132, 172),
+    RED      = Color3.fromRGB(180, 55, 68),
+    BLUE     = Color3.fromRGB(50, 98, 188),
+    GREEN    = Color3.fromRGB(38, 140, 104),
+    AMBER    = Color3.fromRGB(148, 112, 30),
+    PURPLE   = Color3.fromRGB(86, 64, 158),
+    SLATE    = Color3.fromRGB(50, 64, 96),
+    ACCENT   = Color3.fromRGB(72, 152, 255),
 }
 
--- Dados
-local remoteList = {}
-local selectedRemote = nil
-local selectedRemoteType = nil
-
--- Função para obter caminho completo
-local function GetFullPath(instance)
-    if not instance then return "nil" end
-    if instance == game then return "game" end
-    if instance == workspace then return "workspace" end
-    
-    local path = {}
-    local current = instance
-    
-    while current and current ~= game do
-        if current == workspace then
-            table.insert(path, 1, "workspace")
-            break
-        end
-        
-        local name = current.Name
-        
-        -- Verificar se precisa de aspas
-        if name:match("^[%a_][%w_]*$") and not name:match("^%d") then
-            table.insert(path, 1, "." .. name)
-        else
-            -- Nome com caracteres especiais
-            name = name:gsub('"', '\\"'):gsub('\\', '\\\\')
-            table.insert(path, 1, '["' .. name .. '"]')
-        end
-        
-        current = current.Parent
-    end
-    
-    if #path == 0 then return "game" end
-    
-    local result = "game" .. table.concat(path)
-    
-    -- Tentar usar GetService
-    local success, service = pcall(function()
-        return game:GetService(instance.ClassName)
-    end)
-    
-    if success and service == instance then
-        return 'game:GetService("' .. instance.ClassName .. '")'
-    end
-    
-    return result
+local function addCorner(parent, radius)
+    local c = Instance.new("UICorner", parent)
+    c.CornerRadius = UDim.new(0, radius or 12)
+    return c
 end
 
--- Criar GUI
-local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "TurtleSpyGUI"
-ScreenGui.ResetOnSpawn = false
-ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-
-pcall(function()
-    ScreenGui.Parent = CoreGui
-end)
-
-if not ScreenGui.Parent then
-    ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+local function addStroke(parent, color, thickness)
+    local s = Instance.new("UIStroke", parent)
+    s.Color     = color or C.BORDER
+    s.Thickness = thickness or 1
+    return s
 end
 
--- Frame Principal
-local MainFrame = Instance.new("Frame")
-MainFrame.Name = "MainFrame"
-MainFrame.Size = UDim2.new(0, 800, 0, 500)
-MainFrame.Position = UDim2.new(0.5, -400, 0.5, -250)
-MainFrame.BackgroundColor3 = colors.mainBg
-MainFrame.BorderSizePixel = 0
-MainFrame.Active = true
-MainFrame.Draggable = true
-MainFrame.Parent = ScreenGui
-
-local MainCorner = Instance.new("UICorner")
-MainCorner.CornerRadius = UDim.new(0, 10)
-MainCorner.Parent = MainFrame
-
--- Header
-local Header = Instance.new("Frame")
-Header.Name = "Header"
-Header.Size = UDim2.new(1, 0, 0, 35)
-Header.BackgroundColor3 = colors.headerColor
-Header.BorderSizePixel = 0
-Header.Parent = MainFrame
-
-local HeaderCorner = Instance.new("UICorner")
-HeaderCorner.CornerRadius = UDim.new(0, 10)
-HeaderCorner.Parent = Header
-
-local HeaderCover = Instance.new("Frame")
-HeaderCover.Size = UDim2.new(1, 0, 0, 12)
-HeaderCover.Position = UDim2.new(0, 0, 1, -12)
-HeaderCover.BackgroundColor3 = colors.headerColor
-HeaderCover.BorderSizePixel = 0
-HeaderCover.Parent = Header
-
-local HeaderShading = Instance.new("Frame")
-HeaderShading.Size = UDim2.new(1, 0, 0, 8)
-HeaderShading.Position = UDim2.new(0, 0, 1, 0)
-HeaderShading.BackgroundColor3 = colors.headerShading
-HeaderShading.BorderSizePixel = 0
-HeaderShading.Parent = Header
-
-local Title = Instance.new("TextLabel")
-Title.Size = UDim2.new(1, -100, 1, 0)
-Title.Position = UDim2.new(0, 10, 0, 0)
-Title.BackgroundTransparency = 1
-Title.Text = "🐢 TurtleSpy V3.0 - Remote Browser"
-Title.TextColor3 = colors.headerText
-Title.Font = Enum.Font.SourceSansBold
-Title.TextSize = 17
-Title.TextXAlignment = Enum.TextXAlignment.Left
-Title.Parent = Header
-
--- Botão Fechar
-local CloseBtn = Instance.new("TextButton")
-CloseBtn.Size = UDim2.new(0, 30, 0, 30)
-CloseBtn.Position = UDim2.new(1, -35, 0, 2.5)
-CloseBtn.BackgroundColor3 = colors.red
-CloseBtn.BorderSizePixel = 0
-CloseBtn.Text = "X"
-CloseBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-CloseBtn.Font = Enum.Font.SourceSansBold
-CloseBtn.TextSize = 16
-CloseBtn.Parent = Header
-
-local CloseCorner = Instance.new("UICorner")
-CloseCorner.CornerRadius = UDim.new(0, 6)
-CloseCorner.Parent = CloseBtn
-
-CloseBtn.MouseButton1Click:Connect(function()
-    ScreenGui.Enabled = false
-end)
-
--- Botão Minimizar
-local MinBtn = Instance.new("TextButton")
-MinBtn.Size = UDim2.new(0, 30, 0, 30)
-MinBtn.Position = UDim2.new(1, -70, 0, 2.5)
-MinBtn.BackgroundColor3 = colors.buttonBg
-MinBtn.BorderSizePixel = 0
-MinBtn.Text = "_"
-MinBtn.TextColor3 = colors.headerText
-MinBtn.Font = Enum.Font.SourceSansBold
-MinBtn.TextSize = 18
-MinBtn.Parent = Header
-
-local MinCorner = Instance.new("UICorner")
-MinCorner.CornerRadius = UDim.new(0, 6)
-MinCorner.Parent = MinBtn
-
-local minimized = false
-MinBtn.MouseButton1Click:Connect(function()
-    minimized = not minimized
-    if minimized then
-        MainFrame.Size = UDim2.new(0, 800, 0, 35)
-    else
-        MainFrame.Size = UDim2.new(0, 800, 0, 500)
-    end
-end)
-
--- Container Principal
-local Container = Instance.new("Frame")
-Container.Size = UDim2.new(1, -20, 1, -50)
-Container.Position = UDim2.new(0, 10, 0, 45)
-Container.BackgroundTransparency = 1
-Container.Parent = MainFrame
-
--- ========== PAINEL ESQUERDO - LISTA DE REMOTES ==========
-local LeftPanel = Instance.new("Frame")
-LeftPanel.Name = "LeftPanel"
-LeftPanel.Size = UDim2.new(0.35, -5, 1, 0)
-LeftPanel.BackgroundColor3 = colors.infoBg
-LeftPanel.BorderSizePixel = 0
-LeftPanel.Parent = Container
-
-local LeftCorner = Instance.new("UICorner")
-LeftCorner.CornerRadius = UDim.new(0, 8)
-LeftCorner.Parent = LeftPanel
-
-local LeftTitle = Instance.new("TextLabel")
-LeftTitle.Size = UDim2.new(1, -10, 0, 25)
-LeftTitle.Position = UDim2.new(0, 5, 0, 5)
-LeftTitle.BackgroundTransparency = 1
-LeftTitle.Text = "📡 Remotes Encontrados (0)"
-LeftTitle.TextColor3 = colors.buttonText
-LeftTitle.Font = Enum.Font.SourceSansBold
-LeftTitle.TextSize = 14
-LeftTitle.TextXAlignment = Enum.TextXAlignment.Left
-LeftTitle.Parent = LeftPanel
-
--- Barra de pesquisa
-local SearchBox = Instance.new("TextBox")
-SearchBox.Size = UDim2.new(1, -10, 0, 30)
-SearchBox.Position = UDim2.new(0, 5, 0, 35)
-SearchBox.BackgroundColor3 = colors.codeBg
-SearchBox.BorderSizePixel = 0
-SearchBox.Text = ""
-SearchBox.PlaceholderText = "🔍 Pesquisar remote..."
-SearchBox.TextColor3 = colors.codeText
-SearchBox.PlaceholderColor3 = colors.scrollBar
-SearchBox.Font = Enum.Font.SourceSans
-SearchBox.TextSize = 13
-SearchBox.TextXAlignment = Enum.TextXAlignment.Left
-SearchBox.Parent = LeftPanel
-
-local SearchCorner = Instance.new("UICorner")
-SearchCorner.CornerRadius = UDim.new(0, 6)
-SearchCorner.Parent = SearchBox
-
--- ScrollFrame para lista
-local RemoteScroll = Instance.new("ScrollingFrame")
-RemoteScroll.Size = UDim2.new(1, -10, 1, -110)
-RemoteScroll.Position = UDim2.new(0, 5, 0, 70)
-RemoteScroll.BackgroundTransparency = 1
-RemoteScroll.BorderSizePixel = 0
-RemoteScroll.ScrollBarThickness = 6
-RemoteScroll.ScrollBarImageColor3 = colors.scrollBar
-RemoteScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
-RemoteScroll.Parent = LeftPanel
-
-local RemoteLayout = Instance.new("UIListLayout")
-RemoteLayout.Padding = UDim.new(0, 3)
-RemoteLayout.SortOrder = Enum.SortOrder.Name
-RemoteLayout.Parent = RemoteScroll
-
-RemoteLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-    RemoteScroll.CanvasSize = UDim2.new(0, 0, 0, RemoteLayout.AbsoluteContentSize.Y + 5)
-end)
-
--- Botão Escanear
-local ScanBtn = Instance.new("TextButton")
-ScanBtn.Size = UDim2.new(1, -10, 0, 30)
-ScanBtn.Position = UDim2.new(0, 5, 1, -35)
-ScanBtn.BackgroundColor3 = colors.green
-ScanBtn.BorderSizePixel = 0
-ScanBtn.Text = "🔄 Escanear Remotes"
-ScanBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-ScanBtn.Font = Enum.Font.SourceSansBold
-ScanBtn.TextSize = 13
-ScanBtn.Parent = LeftPanel
-
-local ScanCorner = Instance.new("UICorner")
-ScanCorner.CornerRadius = UDim.new(0, 6)
-ScanCorner.Parent = ScanBtn
-
--- ========== PAINEL DIREITO - INFORMAÇÕES ==========
-local RightPanel = Instance.new("Frame")
-RightPanel.Name = "RightPanel"
-RightPanel.Size = UDim2.new(0.65, -5, 1, 0)
-RightPanel.Position = UDim2.new(0.35, 5, 0, 0)
-RightPanel.BackgroundColor3 = colors.infoBg
-RightPanel.BorderSizePixel = 0
-RightPanel.Parent = Container
-
-local RightCorner = Instance.new("UICorner")
-RightCorner.CornerRadius = UDim.new(0, 8)
-RightCorner.Parent = RightPanel
-
-local RightTitle = Instance.new("TextLabel")
-RightTitle.Size = UDim2.new(1, -10, 0, 25)
-RightTitle.Position = UDim2.new(0, 5, 0, 5)
-RightTitle.BackgroundTransparency = 1
-RightTitle.Text = "📝 Informações do Remote"
-RightTitle.TextColor3 = colors.buttonText
-RightTitle.Font = Enum.Font.SourceSansBold
-RightTitle.TextSize = 14
-RightTitle.TextXAlignment = Enum.TextXAlignment.Left
-RightTitle.Parent = RightPanel
-
--- Caixa de código
-local CodeFrame = Instance.new("ScrollingFrame")
-CodeFrame.Size = UDim2.new(1, -10, 0.5, -5)
-CodeFrame.Position = UDim2.new(0, 5, 0, 35)
-CodeFrame.BackgroundColor3 = colors.codeBg
-CodeFrame.BorderSizePixel = 0
-CodeFrame.ScrollBarThickness = 6
-CodeFrame.ScrollBarImageColor3 = colors.scrollBar
-CodeFrame.CanvasSize = UDim2.new(2, 0, 0, 100)
-CodeFrame.Parent = RightPanel
-
-local CodeCorner = Instance.new("UICorner")
-CodeCorner.CornerRadius = UDim.new(0, 6)
-CodeCorner.Parent = CodeFrame
-
-local CodeComment = Instance.new("TextLabel")
-CodeComment.Size = UDim2.new(0, 10000, 0, 20)
-CodeComment.Position = UDim2.new(0, 5, 0, 5)
-CodeComment.BackgroundTransparency = 1
-CodeComment.Text = "-- TurtleSpy V3.0 - Selecione um remote da lista"
-CodeComment.TextColor3 = colors.codeComment
-CodeComment.Font = Enum.Font.Code
-CodeComment.TextSize = 13
-CodeComment.TextXAlignment = Enum.TextXAlignment.Left
-CodeComment.Parent = CodeFrame
-
-local CodeText = Instance.new("TextLabel")
-CodeText.Size = UDim2.new(0, 10000, 0, 20)
-CodeText.Position = UDim2.new(0, 5, 0, 30)
-CodeText.BackgroundTransparency = 1
-CodeText.Text = ""
-CodeText.TextColor3 = colors.codeText
-CodeText.Font = Enum.Font.Code
-CodeText.TextSize = 13
-CodeText.TextXAlignment = Enum.TextXAlignment.Left
-CodeText.Parent = CodeFrame
-
--- Container de botões
-local ButtonScroll = Instance.new("ScrollingFrame")
-ButtonScroll.Size = UDim2.new(1, -10, 0.5, -40)
-ButtonScroll.Position = UDim2.new(0, 5, 0.5, 5)
-ButtonScroll.BackgroundTransparency = 1
-ButtonScroll.BorderSizePixel = 0
-ButtonScroll.ScrollBarThickness = 6
-ButtonScroll.ScrollBarImageColor3 = colors.scrollBar
-ButtonScroll.CanvasSize = UDim2.new(0, 0, 0, 400)
-ButtonScroll.Parent = RightPanel
-
-local ButtonLayout = Instance.new("UIListLayout")
-ButtonLayout.Padding = UDim.new(0, 5)
-ButtonLayout.Parent = ButtonScroll
-
-ButtonLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-    ButtonScroll.CanvasSize = UDim2.new(0, 0, 0, ButtonLayout.AbsoluteContentSize.Y + 5)
-end)
-
--- Função para criar botões
-local function CreateButton(text, parent)
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(1, 0, 0, 30)
-    btn.BackgroundColor3 = colors.buttonBg
-    btn.BorderColor3 = colors.buttonBorder
-    btn.BorderSizePixel = 1
-    btn.Text = text
-    btn.TextColor3 = colors.buttonText
-    btn.Font = Enum.Font.SourceSans
-    btn.TextSize = 13
-    btn.Parent = parent or ButtonScroll
-    
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 6)
-    corner.Parent = btn
-    
-    return btn
+local function makeLbl(parent, props)
+    local lbl = Instance.new("TextLabel")
+    lbl.BackgroundTransparency = 1
+    lbl.Font      = props.font or Enum.Font.Gotham
+    lbl.TextSize  = props.size or 11
+    lbl.TextColor3 = props.color or C.TEXT
+    lbl.Text      = props.text or ""
+    lbl.Size      = props.sz   or UDim2.new(1, 0, 0, 18)
+    lbl.Position  = props.pos  or UDim2.new(0, 0, 0, 0)
+    lbl.TextXAlignment = props.xa or Enum.TextXAlignment.Left
+    lbl.TextWrapped = props.wrap or false
+    lbl.Parent    = parent
+    return lbl
 end
 
--- Criar botões
-local CopyPathBtn = CreateButton("📋 Copiar Caminho")
-local CopyFireBtn = CreateButton("🚀 Copiar com :FireServer()")
-local CopyInvokeBtn = CreateButton("⚡ Copiar com :InvokeServer()")
-local CopyScriptBtn = CreateButton("📜 Copiar Caminho do Script")
-local DecompileBtn = CreateButton("🔓 Decompile Script")
-local TestFireBtn = CreateButton("▶️ Testar FireServer()")
-local TestInvokeBtn = CreateButton("▶️ Testar InvokeServer()")
-
--- Info do executor
-local InfoText = Instance.new("TextLabel")
-InfoText.Size = UDim2.new(1, 0, 0, 20)
-InfoText.BackgroundTransparency = 1
-InfoText.Text = string.format(
-    "Executor: setclipboard=%s | decompile=%s",
-    hasSetClipboard and "✅" or "❌",
-    hasDecompile and "✅" or "❌"
-)
-InfoText.TextColor3 = colors.codeComment
-InfoText.Font = Enum.Font.Code
-InfoText.TextSize = 11
-InfoText.TextXAlignment = Enum.TextXAlignment.Left
-InfoText.Parent = ButtonScroll
-
--- Função para criar item da lista
-local function CreateRemoteItem(remote)
-    local isEvent = remote:IsA("RemoteEvent")
-    
-    local item = Instance.new("TextButton")
-    item.Name = remote.Name
-    item.Size = UDim2.new(1, 0, 0, 30)
-    item.BackgroundColor3 = colors.buttonBg
-    item.BorderColor3 = colors.buttonBorder
-    item.BorderSizePixel = 1
-    item.Text = ""
-    item.AutoButtonColor = false
-    item.Parent = RemoteScroll
-    
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 6)
-    corner.Parent = item
-    
-    local icon = Instance.new("TextLabel")
-    icon.Size = UDim2.new(0, 25, 1, 0)
-    icon.BackgroundTransparency = 1
-    icon.Text = isEvent and "📡" or "⚡"
-    icon.TextColor3 = colors.buttonText
-    icon.TextSize = 14
-    icon.Parent = item
-    
-    local name = Instance.new("TextLabel")
-    name.Size = UDim2.new(1, -30, 1, 0)
-    name.Position = UDim2.new(0, 25, 0, 0)
-    name.BackgroundTransparency = 1
-    name.Text = remote.Name
-    name.TextColor3 = colors.buttonText
-    name.Font = Enum.Font.SourceSans
-    name.TextSize = 12
-    name.TextXAlignment = Enum.TextXAlignment.Left
-    name.TextTruncate = Enum.TextTruncate.AtEnd
-    name.Parent = item
-    
-    item.MouseButton1Click:Connect(function()
-        selectedRemote = remote
-        selectedRemoteType = isEvent and "RemoteEvent" or "RemoteFunction"
-        
-        -- Atualizar visual
-        for _, child in ipairs(RemoteScroll:GetChildren()) do
-            if child:IsA("TextButton") then
-                child.BackgroundColor3 = colors.buttonBg
-            end
-        end
-        item.BackgroundColor3 = Color3.fromRGB(70, 80, 95)
-        
-        -- Atualizar código
-        local path = GetFullPath(remote)
-        local parent = remote.Parent and GetFullPath(remote.Parent) or "nil"
-        
-        CodeComment.Text = string.format(
-            "-- Nome: %s\n-- Tipo: %s\n-- Parent: %s",
-            remote.Name,
-            selectedRemoteType,
-            parent
-        )
-        
-        CodeText.Text = path
-        
-        RightTitle.Text = "📝 Info: " .. remote.Name
-    end)
-    
-    return item
+local function pulse(button)
+    local orig = button.Size
+    local small = UDim2.new(orig.X.Scale, orig.X.Offset - 4, orig.Y.Scale, orig.Y.Offset - 4)
+    local d = TweenService:Create(button, TweenInfo.new(0.06), {Size = small})
+    local u = TweenService:Create(button, TweenInfo.new(0.09), {Size = orig})
+    d:Play()
+    d.Completed:Connect(function() u:Play() end)
 end
 
--- Função para escanear remotes
-local function ScanRemotes(searchTerm)
-    -- Limpar lista
-    for _, child in ipairs(RemoteScroll:GetChildren()) do
-        if child:IsA("TextButton") then
-            child:Destroy()
-        end
-    end
-    
-    remoteList = {}
-    local count = 0
-    
-    -- Escanear game
-    for _, obj in ipairs(game:GetDescendants()) do
-        if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") then
-            if not searchTerm or searchTerm == "" or obj.Name:lower():find(searchTerm:lower(), 1, true) then
-                table.insert(remoteList, obj)
-                CreateRemoteItem(obj)
-                count = count + 1
-            end
-        end
-    end
-    
-    LeftTitle.Text = string.format("📡 Remotes Encontrados (%d)", count)
-    
-    ScanBtn.Text = "✅ " .. count .. " remotes encontrados"
-    task.wait(1.5)
-    ScanBtn.Text = "🔄 Escanear Remotes"
+local function makeBtn(parent, text, color, sz, pos, cb)
+    local b = Instance.new("TextButton")
+    b.Size             = sz
+    b.Position         = pos
+    b.BackgroundColor3 = color
+    b.BorderSizePixel  = 0
+    b.Text             = text
+    b.TextColor3       = Color3.fromRGB(240, 245, 255)
+    b.Font             = Enum.Font.GothamBold
+    b.TextSize         = 10
+    b.AutoButtonColor  = false
+    b.Parent           = parent
+    addCorner(b, 8)
+    addStroke(b, color:Lerp(Color3.new(1,1,1), 0.18))
+    b.MouseEnter:Connect(function()
+        TweenService:Create(b, TweenInfo.new(0.1), {BackgroundColor3 = color:Lerp(Color3.new(1,1,1), 0.1)}):Play()
+    end)
+    b.MouseLeave:Connect(function()
+        TweenService:Create(b, TweenInfo.new(0.1), {BackgroundColor3 = color}):Play()
+    end)
+    b.MouseButton1Click:Connect(function()
+        pulse(b)
+        cb()
+    end)
+    return b
 end
 
--- Função para feedback visual
-local function ButtonFeedback(button, text, color, duration)
-    local originalText = button.Text
-    local originalColor = button.BackgroundColor3
-    
-    button.Text = text
-    button.BackgroundColor3 = color or colors.green
-    
-    task.wait(duration or 1.5)
-    
-    button.Text = originalText
-    button.BackgroundColor3 = originalColor
+-- ─── Painel principal (menor: 320×270) ───────────────────────────────────────
+
+local root = Instance.new("Frame")
+root.Size            = UDim2.new(0, 320, 0, 268)
+root.Position        = UDim2.new(0, 12, 0.5, -134)
+root.BackgroundColor3 = C.BG
+root.BorderSizePixel = 0
+root.Active          = true
+root.Draggable       = true
+root.Parent          = sg
+addCorner(root, 16)
+addStroke(root, C.BORDER)
+
+-- Cabeçalho
+local hdr = Instance.new("Frame")
+hdr.Size             = UDim2.new(1, 0, 0, 48)
+hdr.BackgroundColor3 = C.BG3
+hdr.BorderSizePixel  = 0
+hdr.Parent           = root
+addCorner(hdr, 16)
+-- tampa o canto redondo de baixo do header
+local hdrFix = Instance.new("Frame")
+hdrFix.Size             = UDim2.new(1, 0, 0, 16)
+hdrFix.Position         = UDim2.new(0, 0, 1, -16)
+hdrFix.BackgroundColor3 = C.BG3
+hdrFix.BorderSizePixel  = 0
+hdrFix.Parent           = hdr
+
+-- Ponto de status (LED)
+statusDot = Instance.new("Frame")
+statusDot.Size             = UDim2.new(0, 8, 0, 8)
+statusDot.Position         = UDim2.new(0, 14, 0, 12)
+statusDot.BackgroundColor3 = C.MUTED
+statusDot.BorderSizePixel  = 0
+statusDot.Parent           = hdr
+addCorner(statusDot, 100)
+
+statusLbl = makeLbl(hdr, {
+    text  = "MOVEMENT STUDIO",
+    font  = Enum.Font.GothamBold,
+    size  = 13,
+    color = C.TEXT,
+    sz    = UDim2.new(1, -40, 0, 20),
+    pos   = UDim2.new(0, 28, 0, 6),
+})
+
+detailsLbl = makeLbl(hdr, {
+    text  = "0 frames | 0.0s | fonte: nenhuma",
+    size  = 9,
+    color = C.MUTED,
+    sz    = UDim2.new(1, -28, 0, 14),
+    pos   = UDim2.new(0, 14, 0, 30),
+})
+
+-- Chips de estado
+local function makeChip(parent, text, x)
+    local chip = Instance.new("TextLabel")
+    chip.Size             = UDim2.new(0, 84, 0, 18)
+    chip.Position         = UDim2.new(0, x, 0, 54)
+    chip.BackgroundColor3 = C.BG2
+    chip.BorderSizePixel  = 0
+    chip.Text             = text
+    chip.TextColor3       = C.TEXT
+    chip.Font             = Enum.Font.GothamMedium
+    chip.TextSize         = 9
+    chip.Parent           = parent
+    addCorner(chip, 100)
+    return chip
 end
 
--- Eventos dos botões
-ScanBtn.MouseButton1Click:Connect(function()
-    ScanRemotes(SearchBox.Text)
+sourceChip = makeChip(root, "GRAVACAO", 10)
+speedChip  = makeChip(root, "1.00x", 100)
+loopChip   = makeChip(root, "LOOP OFF", 190)
+
+-- Barra de progresso
+local progressBg = Instance.new("Frame")
+progressBg.Size             = UDim2.new(1, -20, 0, 4)
+progressBg.Position         = UDim2.new(0, 10, 0, 78)
+progressBg.BackgroundColor3 = C.BG3
+progressBg.BorderSizePixel  = 0
+progressBg.Parent           = root
+addCorner(progressBg, 100)
+
+progressFill = Instance.new("Frame")
+progressFill.Size             = UDim2.new(0, 0, 1, 0)
+progressFill.BackgroundColor3 = C.ACCENT
+progressFill.BorderSizePixel  = 0
+progressFill.Parent           = progressBg
+addCorner(progressFill, 100)
+
+progressLbl = makeLbl(root, {
+    text  = "0 / 0",
+    size  = 8,
+    color = C.MUTED,
+    sz    = UDim2.new(1, -20, 0, 12),
+    pos   = UDim2.new(0, 10, 0, 84),
+    xa    = Enum.TextXAlignment.Right,
+})
+
+-- Bloco de controles primários (REC, PLAY, PAUSE, LOOP)
+local row1 = Instance.new("Frame")
+row1.Size             = UDim2.new(1, -20, 0, 30)
+row1.Position         = UDim2.new(0, 10, 0, 100)
+row1.BackgroundTransparency = 1
+row1.Parent           = root
+
+local BW = 68  -- largura botão
+local GAP = 4
+
+recBtn   = makeBtn(row1, "REC",   C.RED,    UDim2.new(0, BW, 0, 30), UDim2.new(0, 0*(BW+GAP), 0, 0), function()
+    if gravando then pararGravacao() else iniciarGravacao() end
+end)
+playBtn  = makeBtn(row1, "PLAY",  C.BLUE,   UDim2.new(0, BW, 0, 30), UDim2.new(0, 1*(BW+GAP), 0, 0), function()
+    if reproduzindo then pararReproducao() else iniciarReproducao() end
+end)
+pauseBtn = makeBtn(row1, "PAUSE", C.AMBER,  UDim2.new(0, BW, 0, 30), UDim2.new(0, 2*(BW+GAP), 0, 0), alternarPausa)
+loopBtn  = makeBtn(row1, "LOOP",  C.PURPLE, UDim2.new(0, BW, 0, 30), UDim2.new(0, 3*(BW+GAP), 0, 0), function()
+    loopAtivo = not loopAtivo
+    setNotice("Loop " .. (loopAtivo and "ativado." or "desativado."), C.MUTED)
 end)
 
-SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
-    if SearchBox.Text ~= "" then
-        ScanRemotes(SearchBox.Text)
-    end
+-- Bloco de controles secundários (LOAD, EXPORT, CLEAR, VEL-, VEL+)
+local row2 = Instance.new("Frame")
+row2.Size             = UDim2.new(1, -20, 0, 30)
+row2.Position         = UDim2.new(0, 10, 0, 136)
+row2.BackgroundTransparency = 1
+row2.Parent           = root
+
+local SW = 54  -- largura botão secundário
+loadBtn     = makeBtn(row2, "LOAD",   C.GREEN, UDim2.new(0, SW, 0, 30), UDim2.new(0, 0*(SW+GAP), 0, 0), carregarDaCaixa)
+exportBtn   = makeBtn(row2, "EXPORT", C.GREEN, UDim2.new(0, SW, 0, 30), UDim2.new(0, 1*(SW+GAP), 0, 0), function()
+    outputBox.Text = gerarCodigo()
+    setNotice("Codigo gerado na caixa.", C.ACCENT)
+end)
+clearBtn    = makeBtn(row2, "CLEAR",  C.SLATE, UDim2.new(0, SW, 0, 30), UDim2.new(0, 2*(SW+GAP), 0, 0), limparTudo)
+speedDownBtn = makeBtn(row2, "VEL-",  C.SLATE, UDim2.new(0, SW, 0, 30), UDim2.new(0, 3*(SW+GAP), 0, 0), function() ajustarVelocidade(-1) end)
+speedUpBtn  = makeBtn(row2, "VEL+",  C.SLATE, UDim2.new(0, SW, 0, 30), UDim2.new(0, 4*(SW+GAP), 0, 0), function() ajustarVelocidade(1) end)
+
+-- Seleção de fonte
+local srcRow = Instance.new("Frame")
+srcRow.Size             = UDim2.new(1, -20, 0, 26)
+srcRow.Position         = UDim2.new(0, 10, 0, 172)
+srcRow.BackgroundTransparency = 1
+srcRow.Parent           = root
+
+local srcTitle = makeLbl(srcRow, {
+    text  = "FONTE:",
+    size  = 9,
+    color = C.MUTED,
+    font  = Enum.Font.GothamBold,
+    sz    = UDim2.new(0, 50, 1, 0),
+    pos   = UDim2.new(0, 0, 0, 0),
+})
+
+local srcGravBtn = makeBtn(srcRow, "GRAVACAO", C.SLATE, UDim2.new(0, 90, 0, 22), UDim2.new(0, 52, 0, 2), function()
+    activeSource = "recorded"
+    setNotice("Fonte: gravacao.", C.ACCENT)
+end)
+local srcCaixaBtn = makeBtn(srcRow, "CAIXA", C.SLATE, UDim2.new(0, 70, 0, 22), UDim2.new(0, 148, 0, 2), function()
+    activeSource = "imported"
+    setNotice("Fonte: caixa.", C.ACCENT)
 end)
 
-CopyPathBtn.MouseButton1Click:Connect(function()
-    if not selectedRemote then
-        ButtonFeedback(CopyPathBtn, "❌ Selecione um remote", colors.red)
-        return
-    end
-    
-    if hasSetClipboard then
-        setclipboard(GetFullPath(selectedRemote))
-        ButtonFeedback(CopyPathBtn, "✅ Caminho copiado!")
+-- Mensagem de status
+noticeLbl = makeLbl(root, {
+    text  = "Pronto. F=Gravar G=Play H=Pause J=Limpar K=Export L=Loop",
+    size  = 8,
+    color = C.MUTED,
+    sz    = UDim2.new(1, -20, 0, 28),
+    pos   = UDim2.new(0, 10, 0, 202),
+    wrap  = true,
+})
+
+-- ─── Painel de código (compacto, ao lado) ────────────────────────────────────
+
+local codePanel = Instance.new("Frame")
+codePanel.Size             = UDim2.new(0, 300, 0, 210)
+codePanel.Position         = UDim2.new(0, 342, 0.5, -105)
+codePanel.BackgroundColor3 = C.BG
+codePanel.BorderSizePixel  = 0
+codePanel.Active           = true
+codePanel.Draggable        = true
+codePanel.Parent           = sg
+addCorner(codePanel, 16)
+addStroke(codePanel, C.BORDER)
+
+makeLbl(codePanel, {
+    text  = "CAIXA DE CODIGO",
+    font  = Enum.Font.GothamBold,
+    size  = 11,
+    color = C.TEXT,
+    sz    = UDim2.new(1, -24, 0, 20),
+    pos   = UDim2.new(0, 14, 0, 10),
+})
+
+makeLbl(codePanel, {
+    text  = "Cole o bloco exportado aqui, depois clique LOAD.",
+    size  = 9,
+    color = C.MUTED,
+    sz    = UDim2.new(1, -24, 0, 14),
+    pos   = UDim2.new(0, 14, 0, 32),
+    wrap  = true,
+})
+
+local outputFrame = Instance.new("Frame")
+outputFrame.Size             = UDim2.new(1, -20, 0, 152)
+outputFrame.Position         = UDim2.new(0, 10, 0, 50)
+outputFrame.BackgroundColor3 = C.BG3
+outputFrame.BorderSizePixel  = 0
+outputFrame.Parent           = codePanel
+addCorner(outputFrame, 10)
+addStroke(outputFrame, C.BORDER)
+
+outputBox = Instance.new("TextBox")
+outputBox.Size             = UDim2.new(1, -14, 1, -14)
+outputBox.Position         = UDim2.new(0, 7, 0, 7)
+outputBox.BackgroundTransparency = 1
+outputBox.ClearTextOnFocus = false
+outputBox.MultiLine        = true
+outputBox.TextEditable     = true
+outputBox.TextWrapped      = false
+outputBox.TextXAlignment   = Enum.TextXAlignment.Left
+outputBox.TextYAlignment   = Enum.TextYAlignment.Top
+outputBox.Text             = ""
+outputBox.TextColor3       = Color3.fromRGB(140, 220, 170)
+outputBox.Font             = Enum.Font.Code
+outputBox.TextSize         = 9
+outputBox.Parent           = outputFrame
+
+-- ─── Atualização de UI ───────────────────────────────────────────────────────
+
+local dotPulseTime = 0
+
+local function updateUi()
+    local path, origem = getActivePath()
+    local totalFrames  = (path and path.f) and #path.f or 0
+    local fps          = (path and path.fps) or RECORD_FPS
+
+    -- Estado / label
+    if gravando then
+        statusLbl.Text       = "GRAVANDO"
+        statusLbl.TextColor3 = Color3.fromRGB(255, 100, 100)
+        recBtn.Text          = "PARAR"
+        -- pisca o LED
+        dotPulseTime = dotPulseTime + 0.016
+        local alpha = (math.sin(dotPulseTime * 6) + 1) / 2
+        statusDot.BackgroundColor3 = Color3.fromRGB(255, 100, 100):Lerp(C.BG3, 1 - alpha)
+    elseif reproduzindo and pausado then
+        statusLbl.Text       = "PAUSADO"
+        statusLbl.TextColor3 = Color3.fromRGB(255, 214, 120)
+        statusDot.BackgroundColor3 = Color3.fromRGB(255, 214, 120)
+        recBtn.Text          = "REC"
+    elseif reproduzindo then
+        statusLbl.Text       = "REPRODUZINDO"
+        statusLbl.TextColor3 = Color3.fromRGB(120, 233, 159)
+        statusDot.BackgroundColor3 = Color3.fromRGB(120, 233, 159)
+        recBtn.Text          = "REC"
     else
-        ButtonFeedback(CopyPathBtn, "❌ setclipboard não suportado", colors.red)
+        statusLbl.Text       = "PRONTO"
+        statusLbl.TextColor3 = C.MUTED
+        statusDot.BackgroundColor3 = C.MUTED
+        recBtn.Text          = "REC"
+        dotPulseTime         = 0
+    end
+
+    playBtn.Text  = reproduzindo and "STOP" or "PLAY"
+    pauseBtn.Text = pausado and "CONT." or "PAUSE"
+    loopBtn.Text  = loopAtivo and "LOOP ON" or "LOOP"
+
+    detailsLbl.Text = string.format(
+        "%d frames | %.1fs | %s",
+        totalFrames,
+        totalFrames > 0 and (totalFrames / fps) or 0,
+        origem or "nenhuma"
+    )
+
+    sourceChip.Text = activeSource == "imported" and "CAIXA" or "GRAVACAO"
+    sourceChip.BackgroundColor3 = activeSource == "imported"
+        and Color3.fromRGB(22, 58, 58) or C.BG2
+
+    speedChip.Text = ("%.2fx"):format(getPlaybackSpeed())
+    loopChip.Text  = loopAtivo and "LOOP ON" or "LOOP OFF"
+    loopChip.BackgroundColor3 = loopAtivo and Color3.fromRGB(50, 38, 90) or C.BG2
+
+    progressLbl.Text = string.format("%d / %d", frameAtual, totalFrames)
+    local pct = totalFrames > 0 and (frameAtual / totalFrames) or 0
+    progressFill.Size = UDim2.new(math.clamp(pct, 0, 1), 0, 1, 0)
+end
+
+RunService.Heartbeat:Connect(updateUi)
+
+-- ─── Atalhos de teclado ──────────────────────────────────────────────────────
+
+UserInputService.InputBegan:Connect(function(inp, gp)
+    if gp then return end
+    local k = inp.KeyCode
+    if     k == Enum.KeyCode.F then
+        if gravando then pararGravacao() else iniciarGravacao() end
+    elseif k == Enum.KeyCode.G then
+        if reproduzindo then pararReproducao() else iniciarReproducao() end
+    elseif k == Enum.KeyCode.H then
+        alternarPausa()
+    elseif k == Enum.KeyCode.J then
+        limparTudo()
+    elseif k == Enum.KeyCode.K then
+        outputBox.Text = gerarCodigo()
+        setNotice("Codigo gerado na caixa.", C.ACCENT)
+    elseif k == Enum.KeyCode.L then
+        loopAtivo = not loopAtivo
+    elseif k == Enum.KeyCode.Equals or k == Enum.KeyCode.KeypadPlus then
+        ajustarVelocidade(1)
+    elseif k == Enum.KeyCode.Minus or k == Enum.KeyCode.KeypadMinus then
+        ajustarVelocidade(-1)
     end
 end)
 
-CopyFireBtn.MouseButton1Click:Connect(function()
-    if not selectedRemote then
-        ButtonFeedback(CopyFireBtn, "❌ Selecione um remote", colors.red)
-        return
-    end
-    
-    if hasSetClipboard then
-        local code = GetFullPath(selectedRemote) .. ":FireServer()"
-        setclipboard(code)
-        ButtonFeedback(CopyFireBtn, "✅ Código copiado!")
+-- ─── Inicialização ───────────────────────────────────────────────────────────
+
+if PATH_DATA then
+    local ok, msg = validarPath(PATH_DATA)
+    if ok then
+        importedPath = PATH_DATA
+        activeSource = "imported"
+        setNotice("PATH_DATA inicial carregado.", C.ACCENT)
     else
-        ButtonFeedback(CopyFireBtn, "❌ setclipboard não suportado", colors.red)
+        setNotice("PATH_DATA invalido: " .. msg, Color3.fromRGB(255, 120, 100))
     end
-end)
+else
+    setNotice("Pronto. F=Gravar G=Play H=Pause J=Limpar K=Export L=Loop", C.MUTED)
+end
 
-CopyInvokeBtn.MouseButton1Click:Connect(function()
-    if not selectedRemote then
-        ButtonFeedback(CopyInvokeBtn, "❌ Selecione um remote", colors.red)
-        return
-    end
-    
-    if hasSetClipboard then
-        local code = GetFullPath(selectedRemote) .. ":InvokeServer()"
-        setclipboard(code)
-        ButtonFeedback(CopyInvokeBtn, "✅ Código copiado!")
-    else
-        ButtonFeedback(CopyInvokeBtn, "❌ setclipboard não suportado", colors.red)
-    end
-end)
-
-CopyScriptBtn.MouseButton1Click:Connect(function()
-    if not selectedRemote then
-        ButtonFeedback(CopyScriptBtn, "❌ Selecione um remote", colors.red)
-        return
-    end
-    
-    local success, script = pcall(function()
-        return getcallingscript and getcallingscript() or getfenv().script
-    end)
-    
-    if success and script then
-        if hasSetClipboard then
-            setclipboard(GetFullPath(script))
-            ButtonFeedback(CopyScriptBtn, "✅ Script copiado!")
-        else
-            ButtonFeedback(CopyScriptBtn, "❌ setclipboard não suportado", colors.red)
-        end
-    else
-        ButtonFeedback(CopyScriptBtn, "❌ Não foi possível obter script", colors.red)
-    end
-end)
-
-DecompileBtn.MouseButton1Click:Connect(function()
-    if not selectedRemote then
-        ButtonFeedback(DecompileBtn, "❌ Selecione um remote", colors.red)
-        return
-    end
-    
-    if not hasDecompile then
-        ButtonFeedback(DecompileBtn, "❌ decompile não suportado", colors.red)
-        return
-    end
-    
-    local success, script = pcall(function()
-        return getcallingscript and getcallingscript() or getfenv().script
-    end)
-    
-    if not success or not script then
-        ButtonFeedback(DecompileBtn, "❌ Script não encontrado", colors.red)
-        return
-    end
-    
-    DecompileBtn.Text = "⏳ Decompilando..."
-    
-    task.spawn(function()
-        local success2, result = pcall(function()
-            return decompile(script)
-        end)
-        
-        if success2 and hasSetClipboard then
-            setclipboard(result)
-            ButtonFeedback(DecompileBtn, "✅ Decompile copiado!", colors.green, 2)
-        else
-            ButtonFeedback(DecompileBtn, "❌ Erro ao decompile", colors.red, 2)
-        end
-    end)
-end)
-
-TestFireBtn.MouseButton1Click:Connect(function()
-    if not selectedRemote then
-        ButtonFeedback(TestFireBtn, "❌ Selecione um remote", colors.red)
-        return
-    end
-    
-    local success, err = pcall(function()
-        if selectedRemote:IsA("RemoteEvent") then
-            selectedRemote:FireServer()
-        else
-            ButtonFeedback(TestFireBtn, "⚠️ Use InvokeServer para Functions", colors.orange)
-        end
-    end)
-    
-    if success then
-        ButtonFeedback(TestFireBtn, "✅ FireServer executado!")
-    else
-        ButtonFeedback(TestFireBtn, "❌ Erro: " .. tostring(err):sub(1, 20), colors.red)
-    end
-end)
-
-TestInvokeBtn.MouseButton1Click:Connect(function()
-    if not selectedRemote then
-        ButtonFeedback(TestInvokeBtn, "❌ Selecione um remote", colors.red)
-        return
-    end
-    
-    local success, result = pcall(function()
-        if selectedRemote:IsA("RemoteFunction") then
-            return selectedRemote:InvokeServer()
-        else
-            ButtonFeedback(TestInvokeBtn, "⚠️ Use FireServer para Events", colors.orange)
-            return nil
-        end
-    end)
-    
-    if success then
-        if hasSetClipboard and result then
-            setclipboard(tostring(result))
-            ButtonFeedback(TestInvokeBtn, "✅ Retorno copiado!")
-        else
-            ButtonFeedback(TestInvokeBtn, "✅ InvokeServer executado!")
-        end
-    else
-        ButtonFeedback(TestInvokeBtn, "❌ Erro: " .. tostring(result):sub(1, 20), colors.red)
-    end
-end)
-
--- Keybind
-UserInputService.InputBegan:Connect(function(input, processed)
-    if not processed and input.KeyCode == settings.Keybind then
-        ScreenGui.Enabled = not ScreenGui.Enabled
-    end
-end)
-
--- Scan inicial
-task.wait(0.5)
-ScanRemotes("")
-
-print("🐢 TurtleSpy V3.0 carregado com sucesso!")
-print("📌 Pressione 'P' para abrir/fechar")
-print("🔍 Clique em 'Escanear Remotes' para atualizar a lista")
-print("💡 Selecione um remote para ver suas informações")
+print("[MOVEMENT STUDIO v2] OK — F=Gravar | G=Play | H=Pause | J=Limpar | K=Export | L=Loop | +/-=Velocidade")
